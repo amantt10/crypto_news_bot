@@ -122,15 +122,18 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     raw_text = message.text or message.caption or ""
-    if not raw_text:
-        logger.info("Post has no text/caption (media-only?) — skipping text pipeline.")
-        return
+    cleaned = clean_text(raw_text) if raw_text else ""
 
-    cleaned = clean_text(raw_text)
+    # Telegram media captions are capped at 1024 chars (vs 4096 for plain text messages)
+    MAX_CAPTION_LEN = 1024
+
+    if not raw_text and not (message.photo or message.video or message.animation or message.document):
+        logger.info("Post has no text, caption, or supported media — skipping.")
+        return
 
     for label, dest in DESTINATIONS.items():
         try:
-            if dest["translate_to"]:
+            if dest["translate_to"] and cleaned:
                 final_text = translate_text(cleaned, dest["translate_to"])
             else:
                 final_text = cleaned
@@ -138,7 +141,26 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
             if FOOTER:
                 final_text += FOOTER
 
-            await context.bot.send_message(chat_id=dest["chat_id"], text=final_text)
+            chat_id = dest["chat_id"]
+
+            if message.photo:
+                caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+                largest_photo = message.photo[-1].file_id  # highest resolution
+                await context.bot.send_photo(chat_id=chat_id, photo=largest_photo, caption=caption)
+            elif message.video:
+                caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+                await context.bot.send_video(chat_id=chat_id, video=message.video.file_id, caption=caption)
+            elif message.animation:
+                caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+                await context.bot.send_animation(chat_id=chat_id, animation=message.animation.file_id, caption=caption)
+            elif message.document:
+                caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+                await context.bot.send_document(chat_id=chat_id, document=message.document.file_id, caption=caption)
+            else:
+                if not final_text:
+                    continue
+                await context.bot.send_message(chat_id=chat_id, text=final_text)
+
             logger.info(f"Posted to {label} channel successfully.")
         except Exception as e:
             # One channel failing shouldn't stop the others
