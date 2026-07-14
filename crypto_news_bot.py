@@ -23,13 +23,14 @@ Run locally (for testing only):
     SPANISH_CHANNEL_ID=-100... INDONESIAN_CHANNEL_ID=-100... python3 crypto_news_bot.py
 """
 
+import asyncio
 import logging
 import os
 import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from deep_translator import GoogleTranslator
-from telegram import Update
+from telegram import Update, InputMediaPhoto, InputMediaVideo, InputMediaDocument
 from telegram.ext import Application, MessageHandler, ContextTypes, filters
 
 logging.basicConfig(
@@ -116,16 +117,28 @@ def translate_text(text: str, target_lang: str) -> str:
         return text  # fall back to original text rather than dropping the post
 
 
-async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    message = update.channel_post
-    if message is None or message.chat_id != SOURCE_CHANNEL_ID:
-        return
+MAX_CAPTION_LEN = 1024  # Telegram's cap for media captions (vs 4096 for plain text messages)
 
-    raw_text = message.text or message.caption or ""
+# Buffers for grouping multi-photo/video posts ("albums") that Telegram delivers
+# as several separate channel_post updates sharing the same media_group_id.
+_pending_groups: dict[str, list] = {}
+_pending_group_timers: dict[str, asyncio.Task] = {}
+_GROUP_DEBOUNCE_SECONDS = 1.5  # wait this long after the last item before sending the album
+
+
+def _build_final_text(raw_text: str, translate_to: str | None) -> str:
     cleaned = clean_text(raw_text) if raw_text else ""
+    if translate_to and cleaned:
+        final_text = translate_text(cleaned, translate_to)
+    else:
+        final_text = cleaned
+    if FOOTER and final_text:
+        final_text += FOOTER
+    return final_text
 
-    # Telegram media captions are capped at 1024 chars (vs 4096 for plain text messages)
-    MAX_CAPTION_LEN = 1024
+
+async def process_single_message(message, context: ContextTypes.DEFAULT_TYPE) -> None:
+    raw_text = message.text or message.caption or ""
 
     if not raw_text and not (message.photo or message.video or message.animation or message.document):
         logger.info("Post has no text, caption, or supported media — skipping.")
@@ -133,14 +146,7 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     for label, dest in DESTINATIONS.items():
         try:
-            if dest["translate_to"] and cleaned:
-                final_text = translate_text(cleaned, dest["translate_to"])
-            else:
-                final_text = cleaned
-
-            if FOOTER:
-                final_text += FOOTER
-
+            final_text = _build_final_text(raw_text, dest["translate_to"])
             chat_id = dest["chat_id"]
 
             if message.photo:
@@ -165,6 +171,70 @@ async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception as e:
             # One channel failing shouldn't stop the others
             logger.error(f"Failed to post to {label} channel ({dest['chat_id']}): {e}")
+
+
+async def process_media_group(media_group_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    messages = _pending_groups.pop(media_group_id, [])
+    _pending_group_timers.pop(media_group_id, None)
+    if not messages:
+        return
+
+    messages.sort(key=lambda m: m.message_id)
+
+    # Telegram attaches the caption to only one message in the group (usually the first)
+    raw_text = ""
+    for m in messages:
+        if m.caption:
+            raw_text = m.caption
+            break
+
+    for label, dest in DESTINATIONS.items():
+        try:
+            final_text = _build_final_text(raw_text, dest["translate_to"])
+            caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+            chat_id = dest["chat_id"]
+
+            media_list = []
+            for i, m in enumerate(messages):
+                item_caption = caption if i == 0 else None  # caption only goes on the first item
+                if m.photo:
+                    media_list.append(InputMediaPhoto(media=m.photo[-1].file_id, caption=item_caption))
+                elif m.video:
+                    media_list.append(InputMediaVideo(media=m.video.file_id, caption=item_caption))
+                elif m.document:
+                    media_list.append(InputMediaDocument(media=m.document.file_id, caption=item_caption))
+                # Animations (GIFs) aren't supported inside media groups by Telegram's API; skipped.
+
+            if not media_list:
+                continue
+
+            await context.bot.send_media_group(chat_id=chat_id, media=media_list)
+            logger.info(f"Posted media group ({len(media_list)} items) to {label} channel successfully.")
+        except Exception as e:
+            logger.error(f"Failed to post media group to {label} channel ({dest['chat_id']}): {e}")
+
+
+async def _debounced_group_processor(media_group_id: str, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await asyncio.sleep(_GROUP_DEBOUNCE_SECONDS)
+    await process_media_group(media_group_id, context)
+
+
+async def handle_channel_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.channel_post
+    if message is None or message.chat_id != SOURCE_CHANNEL_ID:
+        return
+
+    if message.media_group_id:
+        gid = message.media_group_id
+        _pending_groups.setdefault(gid, []).append(message)
+
+        existing_timer = _pending_group_timers.get(gid)
+        if existing_timer:
+            existing_timer.cancel()
+        _pending_group_timers[gid] = asyncio.create_task(_debounced_group_processor(gid, context))
+        return
+
+    await process_single_message(message, context)
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
