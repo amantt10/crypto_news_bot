@@ -78,10 +78,10 @@ DESTINATIONS = {
 }
 
 # Patterns to strip out of every post before forwarding.
-# Add/edit these regex patterns to match your channel's actual tag/signature.
-# Examples included below — delete or adjust as needed.
+# @\w{3,32} matches ANY Telegram-style handle (e.g. @News_Crypto, @bittick,
+# or any future source tag) so you don't need to keep editing this by hand.
 REMOVE_PATTERNS = [
-    r"@CryptoNewsChannel",          # a channel mention/username tag
+    r"@\w{3,32}",                    # any @handle / channel mention, anywhere in the text
     r"#\w+",                        # any hashtags
     r"Follow us.*$",                # a promo/signature line (case-insensitive, see flag below)
 ]
