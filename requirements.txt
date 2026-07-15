@@ -1,2 +1,3 @@
 python-telegram-bot==21.6
 deep-translator==1.11.4
+telethon==1.36.0
