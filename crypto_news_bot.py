@@ -1,45 +1,38 @@
 """
-Crypto News Channel Forwarder Bot (v2 — multi-language, non-admin source)
+Crypto News Channel Forwarder Bot (multi-language, multi-channel edition)
 --------------------------------------------------------------------------
-Reads new posts from a source channel you are only a SUBSCRIBER of (via a
-Telethon "userbot" logged into your own Telegram account), cleans them up
-(strips @handles and hashtags), translates them into English/French/Spanish/
-Indonesian/German/Italian, and posts to all configured destination channels
-(via your bot, which must be admin there) — including multi-image albums.
+Reads new posts from a source channel using YOUR Telegram account (via
+Telethon), since you're not an admin there — cleans them up, translates
+them into English/French/Spanish/Indonesian/German/Italian, and posts the
+results to all your destination channels using the bot.
 
-How media moves: the userbot downloads each photo/video's raw bytes once,
-then those bytes are re-uploaded via the bot to every destination channel.
-(A Telethon-downloaded file's ID can't be reused directly through the Bot
-API, since file IDs are scoped per-bot — re-uploading the bytes is the
-reliable way around that.)
-
-All secrets and channel IDs are read from environment variables — set these
+All secrets and channel IDs are read from environment variables — set them
 in Render's dashboard under Environment:
 
-    BOT_TOKEN                - your bot token from BotFather (used for POSTING only)
+    BOT_TOKEN                - bot token from BotFather (posts to destination channels)
     TELEGRAM_API_ID          - your personal api_id from my.telegram.org
     TELEGRAM_API_HASH        - your personal api_hash from my.telegram.org
-    TELEGRAM_SESSION         - a Telethon StringSession (see generate_session.py —
-                                 run that file LOCALLY once to produce this string;
-                                 it cannot be generated on Render since it needs
-                                 your live login code sent to your Telegram app)
-    SOURCE_CHANNEL_ID        - numeric chat ID of the source channel you read from
+    TELEGRAM_SESSION         - the session string from generate_session.py
 
-    ENGLISH_CHANNEL_IDS      - comma-separated numeric chat IDs, e.g. "-100111,-100222,-100333"
-    FRENCH_CHANNEL_IDS       - comma-separated numeric chat IDs
-    SPANISH_CHANNEL_IDS      - comma-separated numeric chat IDs
-    INDONESIAN_CHANNEL_IDS   - comma-separated numeric chat IDs
-    GERMAN_CHANNEL_IDS       - comma-separated numeric chat IDs
-    ITALIAN_CHANNEL_IDS      - comma-separated numeric chat IDs
+    SOURCE_CHANNEL_ID        - numeric chat ID of the source channel (you're a member, not admin)
 
-    FOOTER_TEXT (optional)   - text appended to every post, e.g. "— Crypto News"
+    ENGLISH_CHANNEL_IDS      - comma-separated chat IDs, e.g. "-100111,-100222,-100333"
+    FRENCH_CHANNEL_IDS       - comma-separated chat IDs
+    SPANISH_CHANNEL_IDS      - comma-separated chat IDs
+    INDONESIAN_CHANNEL_IDS   - comma-separated chat IDs
+    GERMAN_CHANNEL_IDS       - comma-separated chat IDs
+    ITALIAN_CHANNEL_IDS      - comma-separated chat IDs
+
+    FOOTER_TEXT (optional)   - text appended to every post
 
 Requirements:
     pip install -r requirements.txt
+
+The bot must be admin (with "Post Messages") in every DESTINATION channel.
+Your personal account just needs to be a regular member of the SOURCE channel.
 """
 
 import asyncio
-import io
 import logging
 import os
 import re
@@ -57,7 +50,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# =========================== CONFIG — READS FROM ENVIRONMENT VARIABLES ===========================
+# =========================== CONFIG (from env vars) ===========================
 
 
 def _require_env(name: str) -> str:
@@ -65,7 +58,7 @@ def _require_env(name: str) -> str:
     if not value:
         raise RuntimeError(
             f"Missing required environment variable: {name}. "
-            f"Set it in Render's dashboard (Environment tab) before running."
+            "Set it in Render's dashboard (Environment tab) before running."
         )
     return value
 
@@ -74,46 +67,57 @@ def _require_env_int(name: str) -> int:
     return int(_require_env(name))
 
 
-def _require_env_id_list(name: str) -> list:
+def _require_env_id_list(name: str) -> list[int]:
     raw = _require_env(name)
-    return [int(x.strip()) for x in raw.split(",") if x.strip()]
+    try:
+        return [int(part.strip()) for part in raw.split(",") if part.strip()]
+    except ValueError:
+        raise RuntimeError(
+            f"Environment variable {name} must be a comma-separated list of numeric "
+            f"channel IDs, e.g. '-1001111111111,-1002222222222'. Got: {raw!r}"
+        )
 
 
 BOT_TOKEN = _require_env("BOT_TOKEN")
+
 TELEGRAM_API_ID = _require_env_int("TELEGRAM_API_ID")
 TELEGRAM_API_HASH = _require_env("TELEGRAM_API_HASH")
 TELEGRAM_SESSION = _require_env("TELEGRAM_SESSION")
+
 SOURCE_CHANNEL_ID = _require_env_int("SOURCE_CHANNEL_ID")
 
-# Each language: translate_to (None = no translation) + list of destination chat IDs.
-LANGUAGE_GROUPS = {
+# Each language: list of destination chat_ids + the translation target code
+# (translate_to = None means "post as-is, no translation")
+DESTINATIONS = {
     "english": {
-        "translate_to": None,
         "chat_ids": _require_env_id_list("ENGLISH_CHANNEL_IDS"),
+        "translate_to": None,
     },
     "french": {
-        "translate_to": "fr",
         "chat_ids": _require_env_id_list("FRENCH_CHANNEL_IDS"),
+        "translate_to": "fr",
     },
     "spanish": {
-        "translate_to": "es",
         "chat_ids": _require_env_id_list("SPANISH_CHANNEL_IDS"),
+        "translate_to": "es",
     },
     "indonesian": {
-        "translate_to": "id",
         "chat_ids": _require_env_id_list("INDONESIAN_CHANNEL_IDS"),
+        "translate_to": "id",
     },
     "german": {
-        "translate_to": "de",
         "chat_ids": _require_env_id_list("GERMAN_CHANNEL_IDS"),
+        "translate_to": "de",
     },
     "italian": {
-        "translate_to": "it",
         "chat_ids": _require_env_id_list("ITALIAN_CHANNEL_IDS"),
+        "translate_to": "it",
     },
 }
 
 # Patterns to strip out of every post before forwarding.
+# @\w{3,32} matches ANY Telegram-style handle (e.g. @News_Crypto, @bittick,
+# or any future source tag) so you don't need to keep editing this by hand.
 REMOVE_PATTERNS = [
     r"@\w{3,32}",   # any @handle / channel mention, anywhere in the text
     r"#\w+",        # any hashtags
@@ -122,9 +126,8 @@ REMOVE_PATTERNS = [
 FOOTER = os.environ.get("FOOTER_TEXT", "")
 
 MAX_CAPTION_LEN = 1024  # Telegram's cap for media captions (vs 4096 for plain text messages)
-SEND_STAGGER_SECONDS = 0.3  # small delay between sends to avoid flood limits across many channels
 
-# ============================================================================
+# ================================================================================
 
 
 def clean_text(text: str) -> str:
@@ -149,7 +152,7 @@ def translate_text(text: str, target_lang: str) -> str:
         return text  # fall back to original text rather than dropping the post
 
 
-def build_final_text(raw_text: str, translate_to) -> str:
+def build_final_text(raw_text: str, translate_to: str | None) -> str:
     cleaned = clean_text(raw_text) if raw_text else ""
     if translate_to and cleaned:
         final_text = translate_text(cleaned, translate_to)
@@ -160,127 +163,57 @@ def build_final_text(raw_text: str, translate_to) -> str:
     return final_text
 
 
-async def post_single(bot: Bot, raw_text: str, media_type: str, media_bytes: bytes) -> None:
-    """media_type is one of: None, 'photo', 'video', 'animation', 'document'."""
-    for lang_label, group in LANGUAGE_GROUPS.items():
-        final_text = build_final_text(raw_text, group["translate_to"])
-        caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+async def send_to_all_destinations(bot: Bot, raw_text: str, media_items: list) -> None:
+    """media_items: list of Telethon Message objects sharing one album (or a
+    single-element list for a normal post). Each has .photo / .video / .document."""
 
-        for chat_id in group["chat_ids"]:
-            try:
-                if media_type == "photo":
-                    await bot.send_photo(chat_id=chat_id, photo=io.BytesIO(media_bytes), caption=caption)
-                elif media_type == "video":
-                    await bot.send_video(chat_id=chat_id, video=io.BytesIO(media_bytes), caption=caption)
-                elif media_type == "animation":
-                    await bot.send_animation(chat_id=chat_id, animation=io.BytesIO(media_bytes), caption=caption)
-                elif media_type == "document":
-                    await bot.send_document(chat_id=chat_id, document=io.BytesIO(media_bytes), caption=caption)
-                else:
-                    if not final_text:
-                        continue
-                    await bot.send_message(chat_id=chat_id, text=final_text)
-
-                logger.info(f"Posted to {lang_label} channel {chat_id} successfully.")
-            except Exception as e:
-                logger.error(f"Failed to post to {lang_label} channel {chat_id}: {e}")
-
-            await asyncio.sleep(SEND_STAGGER_SECONDS)
-
-
-async def post_album(bot: Bot, raw_text: str, media_items: list) -> None:
-    """media_items: list of dicts {"type": "photo"/"video", "bytes": bytes}."""
-    for lang_label, group in LANGUAGE_GROUPS.items():
-        final_text = build_final_text(raw_text, group["translate_to"])
-        caption = final_text[:MAX_CAPTION_LEN] if final_text else None
-
-        for chat_id in group["chat_ids"]:
-            try:
-                media_list = []
-                for i, item in enumerate(media_items):
-                    item_caption = caption if i == 0 else None
-                    file_obj = io.BytesIO(item["bytes"])
-                    if item["type"] == "photo":
-                        media_list.append(InputMediaPhoto(media=file_obj, caption=item_caption))
-                    elif item["type"] == "video":
-                        media_list.append(InputMediaVideo(media=file_obj, caption=item_caption))
-
-                if not media_list:
-                    continue
-
-                await bot.send_media_group(chat_id=chat_id, media=media_list)
-                logger.info(f"Posted album ({len(media_list)} items) to {lang_label} channel {chat_id} successfully.")
-            except Exception as e:
-                logger.error(f"Failed to post album to {lang_label} channel {chat_id}: {e}")
-
-            await asyncio.sleep(SEND_STAGGER_SECONDS)
-
-
-async def run_userbot() -> None:
-    bot = Bot(token=BOT_TOKEN)
-    client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID, TELEGRAM_API_HASH)
-
-    await client.start()
-    logger.info("Telethon userbot logged in and listening for new posts...")
-
-    # Pre-populate the entity cache so SOURCE_CHANNEL_ID resolves correctly
-    await client.get_dialogs()
-
-    @client.on(events.NewMessage(chats=SOURCE_CHANNEL_ID))
-    async def on_new_message(event):
-        if event.grouped_id:
-            return  # albums are handled by on_album below instead
-
-        message = event.message
-        raw_text = message.text or ""
-
-        media_type = None
-        media_bytes = None
+    for label, dest in DESTINATIONS.items():
         try:
-            if message.photo:
-                media_type = "photo"
-                media_bytes = await client.download_media(message.photo, file=bytes)
-            elif message.video:
-                media_type = "video"
-                media_bytes = await client.download_media(message.video, file=bytes)
-            elif message.gif:
-                media_type = "animation"
-                media_bytes = await client.download_media(message.gif, file=bytes)
-            elif message.document:
-                media_type = "document"
-                media_bytes = await client.download_media(message.document, file=bytes)
+            final_text = build_final_text(raw_text, dest["translate_to"])
+            caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+
+            for chat_id in dest["chat_ids"]:
+                try:
+                    if len(media_items) > 1:
+                        media_list = []
+                        for i, m in enumerate(media_items):
+                            item_caption = caption if i == 0 else None
+                            file_bytes = await m.download_media(bytes)
+                            if m.photo:
+                                media_list.append(InputMediaPhoto(media=file_bytes, caption=item_caption))
+                            elif m.video:
+                                media_list.append(InputMediaVideo(media=file_bytes, caption=item_caption))
+                            elif m.document:
+                                media_list.append(InputMediaDocument(media=file_bytes, caption=item_caption))
+                        if media_list:
+                            await bot.send_media_group(chat_id=chat_id, media=media_list)
+                        else:
+                            continue
+                    else:
+                        m = media_items[0]
+                        if m.photo:
+                            file_bytes = await m.download_media(bytes)
+                            await bot.send_photo(chat_id=chat_id, photo=file_bytes, caption=caption)
+                        elif m.video:
+                            file_bytes = await m.download_media(bytes)
+                            await bot.send_video(chat_id=chat_id, video=file_bytes, caption=caption)
+                        elif m.document:
+                            file_bytes = await m.download_media(bytes)
+                            await bot.send_document(chat_id=chat_id, document=file_bytes, caption=caption)
+                        elif m.gif:
+                            file_bytes = await m.download_media(bytes)
+                            await bot.send_animation(chat_id=chat_id, animation=file_bytes, caption=caption)
+                        else:
+                            if not final_text:
+                                continue
+                            await bot.send_message(chat_id=chat_id, text=final_text)
+
+                    logger.info(f"Posted to {label} channel {chat_id} successfully.")
+                except Exception as e:
+                    # One channel failing shouldn't stop the others
+                    logger.error(f"Failed to post to {label} channel ({chat_id}): {e}")
         except Exception as e:
-            logger.error(f"Failed to download media from source post: {e}")
-            return
-
-        if not raw_text and media_type is None:
-            logger.info("Post has no text or supported media — skipping.")
-            return
-
-        await post_single(bot, raw_text, media_type, media_bytes)
-
-    @client.on(events.Album(chats=SOURCE_CHANNEL_ID))
-    async def on_album(event):
-        raw_text = event.text or ""
-        media_items = []
-        for m in event.messages:
-            try:
-                if m.photo:
-                    data = await client.download_media(m.photo, file=bytes)
-                    media_items.append({"type": "photo", "bytes": data})
-                elif m.video:
-                    data = await client.download_media(m.video, file=bytes)
-                    media_items.append({"type": "video", "bytes": data})
-            except Exception as e:
-                logger.error(f"Failed to download an item from album: {e}")
-
-        if not media_items:
-            logger.info("Album had no downloadable photo/video items — skipping.")
-            return
-
-        await post_album(bot, raw_text, media_items)
-
-    await client.run_until_disconnected()
+            logger.error(f"Failed processing language '{label}': {e}")
 
 
 class HealthCheckHandler(BaseHTTPRequestHandler):
@@ -293,7 +226,7 @@ class HealthCheckHandler(BaseHTTPRequestHandler):
         self.wfile.write(b"Bot is alive")
 
     def log_message(self, format, *args):
-        pass
+        pass  # silence default request logging
 
 
 def start_health_server():
@@ -303,10 +236,37 @@ def start_health_server():
     server.serve_forever()
 
 
-def main() -> None:
+async def main() -> None:
     threading.Thread(target=start_health_server, daemon=True).start()
-    asyncio.run(run_userbot())
+
+    bot = Bot(token=BOT_TOKEN)
+    client = TelegramClient(StringSession(TELEGRAM_SESSION), TELEGRAM_API_ID, TELEGRAM_API_HASH)
+
+    @client.on(events.Album(chats=SOURCE_CHANNEL_ID))
+    async def album_handler(event):
+        raw_text = ""
+        for m in event.messages:
+            if m.text:
+                raw_text = m.text
+                break
+        logger.info(f"Received album with {len(event.messages)} items from source channel.")
+        await send_to_all_destinations(bot, raw_text, event.messages)
+
+    @client.on(events.NewMessage(chats=SOURCE_CHANNEL_ID))
+    async def single_handler(event):
+        if event.message.grouped_id:
+            return  # handled by album_handler instead
+        raw_text = event.message.text or ""
+        if not raw_text and not (event.message.photo or event.message.video or event.message.document or event.message.gif):
+            logger.info("Post has no text or supported media — skipping.")
+            return
+        logger.info("Received single post from source channel.")
+        await send_to_all_destinations(bot, raw_text, [event.message])
+
+    await client.start()
+    logger.info("Bot started. Listening for new posts via your account...")
+    await client.run_until_disconnected()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
