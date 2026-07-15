@@ -246,8 +246,8 @@ async def main() -> None:
     async def album_handler(event):
         raw_text = ""
         for m in event.messages:
-            if m.text:
-                raw_text = m.text
+            if m.raw_text:
+                raw_text = m.raw_text
                 break
         logger.info(f"Received album with {len(event.messages)} items from source channel.")
         await send_to_all_destinations(bot, raw_text, event.messages)
@@ -256,7 +256,7 @@ async def main() -> None:
     async def single_handler(event):
         if event.message.grouped_id:
             return  # handled by album_handler instead
-        raw_text = event.message.text or ""
+        raw_text = event.message.raw_text or ""
         if not raw_text and not (event.message.photo or event.message.video or event.message.document or event.message.gif):
             logger.info("Post has no text or supported media — skipping.")
             return
