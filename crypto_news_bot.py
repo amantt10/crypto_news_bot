@@ -264,6 +264,8 @@ async def main() -> None:
         await send_to_all_destinations(bot, raw_text, [event.message])
 
     await client.start()
+    logger.info("Telethon client logged in. Syncing dialogs...")
+    await client.get_dialogs()  # populates entity cache so SOURCE_CHANNEL_ID resolves correctly
     logger.info("Bot started. Listening for new posts via your account...")
     await client.run_until_disconnected()
 
