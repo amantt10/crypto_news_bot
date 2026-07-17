@@ -141,21 +141,35 @@ def clean_text(text: str) -> str:
     return cleaned
 
 
-def translate_text(text: str, target_lang: str) -> str:
-    """Translate text using Google Translate (free, via deep-translator)."""
+async def translate_text(text: str, target_lang: str) -> str:
+    """Translate text using Google Translate (free, via deep-translator).
+
+    IMPORTANT: deep-translator makes a blocking, synchronous network call.
+    Running it directly on the asyncio event loop would freeze the ENTIRE
+    bot (including the Telethon connection reading the source channel) if
+    the call ever hangs. asyncio.to_thread + a timeout prevents that.
+    """
     if not text:
         return text
     try:
-        return GoogleTranslator(source="auto", target=target_lang).translate(text)
+        return await asyncio.wait_for(
+            asyncio.to_thread(
+                lambda: GoogleTranslator(source="auto", target=target_lang).translate(text)
+            ),
+            timeout=15,
+        )
+    except asyncio.TimeoutError:
+        logger.error(f"Translation timed out for target '{target_lang}' — using original text.")
+        return text
     except Exception as e:
         logger.error(f"Translation failed for target '{target_lang}': {e}")
         return text  # fall back to original text rather than dropping the post
 
 
-def build_final_text(raw_text: str, translate_to: str | None) -> str:
+async def build_final_text(raw_text: str, translate_to: str | None) -> str:
     cleaned = clean_text(raw_text) if raw_text else ""
     if translate_to and cleaned:
-        final_text = translate_text(cleaned, translate_to)
+        final_text = await translate_text(cleaned, translate_to)
     else:
         final_text = cleaned
     if FOOTER and final_text:
@@ -169,7 +183,7 @@ async def send_to_all_destinations(bot: Bot, raw_text: str, media_items: list) -
 
     for label, dest in DESTINATIONS.items():
         try:
-            final_text = build_final_text(raw_text, dest["translate_to"])
+            final_text = await build_final_text(raw_text, dest["translate_to"])
             caption = final_text[:MAX_CAPTION_LEN] if final_text else None
 
             for chat_id in dest["chat_ids"]:
