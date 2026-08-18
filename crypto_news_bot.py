@@ -141,35 +141,72 @@ def clean_text(text: str) -> str:
     return cleaned
 
 
-async def translate_text(text: str, target_lang: str) -> str:
+def _looks_like_translation_error(text: str) -> bool:
+    """Detect Google's generic error page slipping through as a 'successful' translation."""
+    if not text:
+        return False
+    lowered = text.lower()
+    error_markers = [
+        "<html", "that's an error", "that’s an error",
+        "error 500", "500.", "server error", "that’s all we know",
+    ]
+    return any(marker in lowered for marker in error_markers)
+
+
+async def translate_text(text: str, target_lang: str, max_retries: int = 2):
     """Translate text using Google Translate (free, via deep-translator).
+    Returns the translated string on success, or None if translation could
+    not be completed after all retries (caller should skip posting rather
+    than fall back to the untranslated English text).
 
     IMPORTANT: deep-translator makes a blocking, synchronous network call.
     Running it directly on the asyncio event loop would freeze the ENTIRE
     bot (including the Telethon connection reading the source channel) if
     the call ever hangs. asyncio.to_thread + a timeout prevents that.
+
+    The free endpoint also occasionally rate-limits and returns an HTML
+    error page instead of raising — we detect that and retry with backoff
+    rather than posting the error page as if it were the translation.
     """
     if not text:
         return text
-    try:
-        return await asyncio.wait_for(
-            asyncio.to_thread(
-                lambda: GoogleTranslator(source="auto", target=target_lang).translate(text)
-            ),
-            timeout=15,
-        )
-    except asyncio.TimeoutError:
-        logger.error(f"Translation timed out for target '{target_lang}' — using original text.")
-        return text
-    except Exception as e:
-        logger.error(f"Translation failed for target '{target_lang}': {e}")
-        return text  # fall back to original text rather than dropping the post
+
+    for attempt in range(max_retries + 1):
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(
+                    lambda: GoogleTranslator(source="auto", target=target_lang).translate(text)
+                ),
+                timeout=15,
+            )
+            if result and not _looks_like_translation_error(result):
+                return result
+            logger.warning(
+                f"Translation attempt {attempt + 1}/{max_retries + 1} for '{target_lang}' "
+                f"returned an error page — retrying..."
+            )
+        except asyncio.TimeoutError:
+            logger.error(f"Translation attempt {attempt + 1}/{max_retries + 1} timed out for '{target_lang}'.")
+        except Exception as e:
+            logger.error(f"Translation attempt {attempt + 1}/{max_retries + 1} failed for '{target_lang}': {e}")
+
+        if attempt < max_retries:
+            await asyncio.sleep(2 * (attempt + 1))  # 2s, then 4s backoff
+
+    logger.error(f"All translation attempts failed for '{target_lang}' — skipping this language's channels for this post.")
+    return None
 
 
-async def build_final_text(raw_text: str, translate_to: str | None) -> str:
+async def build_final_text(raw_text: str, translate_to: str | None):
+    """Returns the final text, or None to signal 'skip this language entirely'
+    (translation failed after retries — never fall back to posting English)."""
     cleaned = clean_text(raw_text) if raw_text else ""
     if translate_to and cleaned:
-        final_text = await translate_text(cleaned, translate_to)
+        translated = await translate_text(cleaned, translate_to)
+        await asyncio.sleep(0.5)  # small gap between languages to avoid bursting the translate endpoint
+        if translated is None:
+            return None
+        final_text = translated
     else:
         final_text = cleaned
     if FOOTER and final_text:
@@ -184,6 +221,13 @@ async def send_to_all_destinations(bot: Bot, raw_text: str, media_items: list) -
     for label, dest in DESTINATIONS.items():
         try:
             final_text = await build_final_text(raw_text, dest["translate_to"])
+
+            if final_text is None:
+                # Translation failed after all retries — skip this language entirely
+                # rather than posting untranslated English into a non-English channel.
+                logger.warning(f"Skipping {label} channels for this post — translation unavailable.")
+                continue
+
             caption = final_text[:MAX_CAPTION_LEN] if final_text else None
 
             for chat_id in dest["chat_ids"]:
