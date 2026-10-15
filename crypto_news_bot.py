@@ -40,7 +40,14 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 from deep_translator import GoogleTranslator
-from telegram import Bot, InputMediaPhoto, InputMediaVideo, InputMediaDocument
+from telegram import (
+    Bot,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    InputMediaPhoto,
+    InputMediaVideo,
+    InputMediaDocument,
+)
 from telethon import TelegramClient, events
 from telethon.sessions import StringSession
 
@@ -124,6 +131,26 @@ REMOVE_PATTERNS = [
 ]
 
 FOOTER = os.environ.get("FOOTER_TEXT", "")
+
+# Button attached under every post (all languages, all channels).
+BUTTON_TEXT = "CONTACT ME ✅"
+
+# English channels link to one account, every other language links to another.
+ENGLISH_BUTTON_URL = "https://t.me/Dubois_Lucas"
+OTHER_LANGUAGES_BUTTON_URL = "https://t.me/miguel_p2p"
+
+# Albums can't carry a button, so it goes in a tiny follow-up message instead.
+ALBUM_BUTTON_MESSAGE_TEXT = "👇"
+
+BUTTON_MARKUPS = {
+    label: InlineKeyboardMarkup([[
+        InlineKeyboardButton(
+            BUTTON_TEXT,
+            url=ENGLISH_BUTTON_URL if label == "english" else OTHER_LANGUAGES_BUTTON_URL,
+        )
+    ]])
+    for label in DESTINATIONS
+}
 
 MAX_CAPTION_LEN = 1024  # Telegram's cap for media captions (vs 4096 for plain text messages)
 
@@ -229,6 +256,7 @@ async def send_to_all_destinations(bot: Bot, raw_text: str, media_items: list) -
                 continue
 
             caption = final_text[:MAX_CAPTION_LEN] if final_text else None
+            button_markup = BUTTON_MARKUPS[label]
 
             for chat_id in dest["chat_ids"]:
                 try:
@@ -245,26 +273,33 @@ async def send_to_all_destinations(bot: Bot, raw_text: str, media_items: list) -
                                 media_list.append(InputMediaDocument(media=file_bytes, caption=item_caption))
                         if media_list:
                             await bot.send_media_group(chat_id=chat_id, media=media_list)
+                            # Telegram doesn't allow buttons on albums, so send the button
+                            # as a small follow-up message directly underneath.
+                            await bot.send_message(
+                                chat_id=chat_id,
+                                text=ALBUM_BUTTON_MESSAGE_TEXT,
+                                reply_markup=button_markup,
+                            )
                         else:
                             continue
                     else:
                         m = media_items[0]
                         if m.photo:
                             file_bytes = await m.download_media(bytes)
-                            await bot.send_photo(chat_id=chat_id, photo=file_bytes, caption=caption)
+                            await bot.send_photo(chat_id=chat_id, photo=file_bytes, caption=caption, reply_markup=button_markup)
                         elif m.video:
                             file_bytes = await m.download_media(bytes)
-                            await bot.send_video(chat_id=chat_id, video=file_bytes, caption=caption)
+                            await bot.send_video(chat_id=chat_id, video=file_bytes, caption=caption, reply_markup=button_markup)
                         elif m.document:
                             file_bytes = await m.download_media(bytes)
-                            await bot.send_document(chat_id=chat_id, document=file_bytes, caption=caption)
+                            await bot.send_document(chat_id=chat_id, document=file_bytes, caption=caption, reply_markup=button_markup)
                         elif m.gif:
                             file_bytes = await m.download_media(bytes)
-                            await bot.send_animation(chat_id=chat_id, animation=file_bytes, caption=caption)
+                            await bot.send_animation(chat_id=chat_id, animation=file_bytes, caption=caption, reply_markup=button_markup)
                         else:
                             if not final_text:
                                 continue
-                            await bot.send_message(chat_id=chat_id, text=final_text)
+                            await bot.send_message(chat_id=chat_id, text=final_text, reply_markup=button_markup)
 
                     logger.info(f"Posted to {label} channel {chat_id} successfully.")
                 except Exception as e:
