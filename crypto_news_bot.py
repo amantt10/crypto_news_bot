@@ -132,8 +132,17 @@ REMOVE_PATTERNS = [
 
 FOOTER = os.environ.get("FOOTER_TEXT", "")
 
-# Button attached under every post (all languages, all channels).
-BUTTON_TEXT = "CONTACT ME ✅"
+# Button attached under every post. The label is hardcoded per language (rather
+# than run through the translator) so it's always correct and never affected by
+# translation rate limits.
+BUTTON_TEXTS = {
+    "english": "CONTACT ME ✅",
+    "french": "CONTACTEZ-MOI ✅",
+    "spanish": "CONTÁCTAME ✅",
+    "indonesian": "HUBUNGI SAYA ✅",
+    "german": "KONTAKTIERE MICH ✅",
+    "italian": "CONTATTAMI ✅",
+}
 
 # English channels link to one account, every other language links to another.
 ENGLISH_BUTTON_URL = "https://t.me/Dubois_Lucas"
@@ -145,7 +154,7 @@ ALBUM_BUTTON_MESSAGE_TEXT = "👇"
 BUTTON_MARKUPS = {
     label: InlineKeyboardMarkup([[
         InlineKeyboardButton(
-            BUTTON_TEXT,
+            BUTTON_TEXTS[label],
             url=ENGLISH_BUTTON_URL if label == "english" else OTHER_LANGUAGES_BUTTON_URL,
         )
     ]])
