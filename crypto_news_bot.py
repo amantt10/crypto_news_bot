@@ -40,6 +40,7 @@ import logging
 import os
 import re
 import threading
+from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import requests
@@ -280,14 +281,48 @@ async def translate_text(text: str, target_lang: str):
     return "".join(out)
 
 
+# ---------------------------------------------------------------------------
+# Translation providers. Google's free endpoint rate-limits (HTTP 429) shared cloud
+# IPs like Render's, so several independent routes are tried in order until one works.
+# ---------------------------------------------------------------------------
+
+_UA = {"User-Agent": "Mozilla/5.0"}
+LINGVA_INSTANCES = [
+    "https://lingva.ml",
+    "https://lingva.lunar.icu",
+    "https://translate.plausibility.cloud",
+    "https://lingva.garudalinux.org",
+]
+DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "").strip()  # optional, most reliable
+DEEPL_CODES = {"fr": "FR", "es": "ES", "id": "ID", "de": "DE", "it": "IT"}
+PROVIDER_COOLDOWN_SECONDS = 90
+_provider_down_until: dict = {}
+
+
+def _deepl_translate_sync(text: str, target_lang: str) -> str:
+    host = "api-free.deepl.com" if DEEPL_API_KEY.endswith(":fx") else "api.deepl.com"
+    resp = requests.post(
+        f"https://{host}/v2/translate",
+        headers={"Authorization": f"DeepL-Auth-Key {DEEPL_API_KEY}"},
+        data={"text": text, "target_lang": DEEPL_CODES.get(target_lang, target_lang.upper()),
+              "preserve_formatting": "1"},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    return resp.json()["translations"][0]["text"]
+
+
+def _google_main_sync(text: str, target_lang: str) -> str:
+    return GoogleTranslator(source="auto", target=target_lang).translate(text)
+
+
 def _gtx_translate_sync(text: str, target_lang: str) -> str:
-    """Backup route: Google's other free translate endpoint, called directly. It's used
-    only when the main (deep-translator) route has failed every retry."""
+    """Google's other free translate endpoint, called directly."""
     resp = requests.post(
         "https://translate.googleapis.com/translate_a/single",
         params={"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t"},
         data={"q": text},
-        headers={"User-Agent": "Mozilla/5.0"},
+        headers=_UA,
         timeout=12,
     )
     resp.raise_for_status()
@@ -295,64 +330,95 @@ def _gtx_translate_sync(text: str, target_lang: str) -> str:
     return "".join(part[0] for part in resp.json()[0] if part and part[0])
 
 
+def _lingva_translate_sync(text: str, target_lang: str) -> str:
+    """Lingva: free public front-ends that run on their own servers (not Render's IP)."""
+    last_error = None
+    for base in LINGVA_INSTANCES:
+        try:
+            resp = requests.get(
+                f"{base}/api/v1/auto/{target_lang}/{quote(text, safe='')}",
+                headers=_UA, timeout=10,
+            )
+            resp.raise_for_status()
+            translated = resp.json().get("translation")
+            if translated:
+                return translated
+            last_error = RuntimeError(f"{base} returned no translation")
+        except Exception as e:
+            last_error = e
+    raise last_error or RuntimeError("no Lingva instance answered")
+
+
+def _mymemory_translate_sync(text: str, target_lang: str) -> str:
+    """MyMemory: free, no signup, but only ~500 characters per request, so work in pieces."""
+    parts = []
+    for piece, sep in _chunk_text(text, 400):
+        if not piece.strip():
+            parts.append(piece + sep)
+            continue
+        resp = requests.get(
+            "https://api.mymemory.translated.net/get",
+            params={"q": piece, "langpair": f"Autodetect|{target_lang}"},
+            headers=_UA, timeout=10,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        translated = (data.get("responseData") or {}).get("translatedText")
+        if not translated or "MYMEMORY WARNING" in translated or str(data.get("responseStatus")) != "200":
+            raise RuntimeError(f"MyMemory refused: {str(translated)[:80]}")
+        parts.append(translated + sep)
+    return "".join(parts)
+
+
+def _providers() -> list:
+    """(name, function, attempts) in the order they are tried."""
+    providers = []
+    if DEEPL_API_KEY:
+        providers.append(("DeepL", _deepl_translate_sync, 1))
+    providers += [
+        ("Google", _google_main_sync, 2),
+        ("Google backup", _gtx_translate_sync, 1),
+        ("Lingva", _lingva_translate_sync, 1),
+        ("MyMemory", _mymemory_translate_sync, 1),
+    ]
+    return providers
+
+
 async def _translate_chunk(text: str, target_lang: str, max_retries: int = 2):
-    """Translate ONE chunk using Google Translate (free, via deep-translator).
-    Returns the translated string on success, or None if translation could
-    not be completed after all retries (caller should skip posting rather
-    than fall back to the untranslated English text).
+    """Translate ONE chunk, trying each provider in turn. Returns the translation, or
+    None if every provider failed (caller then skips that language rather than posting
+    untranslated English).
 
-    IMPORTANT: deep-translator makes a blocking, synchronous network call.
-    Running it directly on the asyncio event loop would freeze the ENTIRE
-    bot (including the Telethon connection reading the source channel) if
-    the call ever hangs. asyncio.to_thread + a timeout prevents that.
-
-    The free endpoint also occasionally rate-limits and returns an HTML
-    error page instead of raising — we detect that and retry with backoff
-    rather than posting the error page as if it were the translation.
-    """
+    The calls are blocking network requests, so each runs in a thread with a timeout —
+    otherwise one hung request would freeze the whole bot. A provider that answered 429
+    (rate limited) is skipped for a short cooldown so later chunks/languages don't waste
+    time on it."""
     if not text:
         return text
 
-    for attempt in range(max_retries + 1):
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(
-                    lambda: GoogleTranslator(source="auto", target=target_lang).translate(text)
-                ),
-                timeout=15,
-            )
-            if result and not _looks_like_translation_error(result):
-                return result
-            logger.warning(
-                f"Translation attempt {attempt + 1}/{max_retries + 1} for '{target_lang}' "
-                f"returned an empty/error response ({(result or '')[:80]!r}) — retrying..."
-            )
-        except asyncio.TimeoutError:
-            logger.error(f"Translation attempt {attempt + 1}/{max_retries + 1} timed out for '{target_lang}'.")
-        except Exception as e:
-            logger.error(f"Translation attempt {attempt + 1}/{max_retries + 1} failed for '{target_lang}': {type(e).__name__}: {e}")
+    loop = asyncio.get_running_loop()
+    for name, func, attempts in _providers():
+        if _provider_down_until.get(name, 0) > loop.time():
+            continue
+        for attempt in range(attempts):
+            try:
+                result = await asyncio.wait_for(asyncio.to_thread(func, text, target_lang), timeout=25)
+                if result and not _looks_like_translation_error(result):
+                    logger.info(f"Translated to '{target_lang}' via {name}.")
+                    return result
+                logger.warning(f"{name} returned an empty/error response for '{target_lang}' ({(result or '')[:60]!r}).")
+            except asyncio.TimeoutError:
+                logger.error(f"{name} timed out for '{target_lang}'.")
+            except Exception as e:
+                message = f"{type(e).__name__}: {e}"
+                logger.error(f"{name} failed for '{target_lang}': {message[:200]}")
+                if "429" in message or "toomanyrequests" in message.lower().replace(" ", ""):
+                    _provider_down_until[name] = loop.time() + PROVIDER_COOLDOWN_SECONDS
+                    break  # rate limited — retrying right now won't help
+            if attempt < attempts - 1:
+                await asyncio.sleep(2)
 
-        if attempt < max_retries:
-            await asyncio.sleep(2 * (attempt + 1))  # 2s, then 4s backoff
-
-    logger.warning(f"Main translation route failed for '{target_lang}' — trying the backup route...")
-    for attempt in range(2):
-        try:
-            result = await asyncio.wait_for(
-                asyncio.to_thread(_gtx_translate_sync, text, target_lang), timeout=15
-            )
-            if result and not _looks_like_translation_error(result):
-                logger.info(f"Backup translation route worked for '{target_lang}'.")
-                return result
-            logger.warning(f"Backup route returned an empty/error response for '{target_lang}'.")
-        except asyncio.TimeoutError:
-            logger.error(f"Backup translation route timed out for '{target_lang}'.")
-        except Exception as e:
-            logger.error(f"Backup translation route failed for '{target_lang}': {type(e).__name__}: {e}")
-        if attempt == 0:
-            await asyncio.sleep(2)
-
-    logger.error(f"All translation attempts failed for '{target_lang}' — skipping this language's channels for this post.")
+    logger.error(f"All translation providers failed for '{target_lang}' — skipping this language's channels for this post.")
     return None
 
 
