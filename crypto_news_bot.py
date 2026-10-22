@@ -42,6 +42,7 @@ import re
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
+import requests
 from deep_translator import GoogleTranslator
 from telegram import (
     Bot,
@@ -279,6 +280,21 @@ async def translate_text(text: str, target_lang: str):
     return "".join(out)
 
 
+def _gtx_translate_sync(text: str, target_lang: str) -> str:
+    """Backup route: Google's other free translate endpoint, called directly. It's used
+    only when the main (deep-translator) route has failed every retry."""
+    resp = requests.post(
+        "https://translate.googleapis.com/translate_a/single",
+        params={"client": "gtx", "sl": "auto", "tl": target_lang, "dt": "t"},
+        data={"q": text},
+        headers={"User-Agent": "Mozilla/5.0"},
+        timeout=12,
+    )
+    resp.raise_for_status()
+    # Response: [[[translated, original, ...], [translated, original, ...], ...], ...]
+    return "".join(part[0] for part in resp.json()[0] if part and part[0])
+
+
 async def _translate_chunk(text: str, target_lang: str, max_retries: int = 2):
     """Translate ONE chunk using Google Translate (free, via deep-translator).
     Returns the translated string on success, or None if translation could
@@ -318,6 +334,23 @@ async def _translate_chunk(text: str, target_lang: str, max_retries: int = 2):
 
         if attempt < max_retries:
             await asyncio.sleep(2 * (attempt + 1))  # 2s, then 4s backoff
+
+    logger.warning(f"Main translation route failed for '{target_lang}' — trying the backup route...")
+    for attempt in range(2):
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(_gtx_translate_sync, text, target_lang), timeout=15
+            )
+            if result and not _looks_like_translation_error(result):
+                logger.info(f"Backup translation route worked for '{target_lang}'.")
+                return result
+            logger.warning(f"Backup route returned an empty/error response for '{target_lang}'.")
+        except asyncio.TimeoutError:
+            logger.error(f"Backup translation route timed out for '{target_lang}'.")
+        except Exception as e:
+            logger.error(f"Backup translation route failed for '{target_lang}': {type(e).__name__}: {e}")
+        if attempt == 0:
+            await asyncio.sleep(2)
 
     logger.error(f"All translation attempts failed for '{target_lang}' — skipping this language's channels for this post.")
     return None
