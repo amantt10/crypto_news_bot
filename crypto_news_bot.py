@@ -39,6 +39,8 @@ import asyncio
 import logging
 import os
 import re
+import subprocess
+import sys
 import threading
 from urllib.parse import quote
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -282,8 +284,8 @@ async def translate_text(text: str, target_lang: str):
 
 
 # ---------------------------------------------------------------------------
-# Translation providers. Prefer local Argos, so Google rate limits can't block posts.
-# Existing external services remain optional fallbacks if local translation fails.
+# Translation providers. Google is the primary translator.
+# Argos runs only if both Google routes fail.
 # ---------------------------------------------------------------------------
 
 _UA = {"User-Agent": "Mozilla/5.0"}
@@ -295,7 +297,7 @@ LINGVA_INSTANCES = [
 ]
 DEEPL_API_KEY = os.environ.get("DEEPL_API_KEY", "").strip()  # optional, most reliable
 DEEPL_CODES = {"fr": "FR", "es": "ES", "id": "ID", "de": "DE", "it": "IT"}
-PROVIDER_COOLDOWN_SECONDS = 90
+PROVIDER_COOLDOWN_SECONDS = 900
 _provider_down_until: dict = {}
 
 
@@ -313,21 +315,36 @@ def _deepl_translate_sync(text: str, target_lang: str) -> str:
 
 
 def _argos_translate_sync(text: str, target_lang: str) -> str:
-    """Offline English->target translation; install models during deploy build.
-    Import lazily so existing Google fallbacks keep working if Argos is absent.
-    """
-    import argostranslate.translate
+    """Bound offline fallback in a separate process so a hung model can be killed.
 
-    installed = {lang.code: lang for lang in argostranslate.translate.get_installed_languages()}
-    source = installed.get("en")
-    target = installed.get(target_lang)
-    if source is None or target is None:
-        raise RuntimeError(f"Argos model en->{target_lang} not installed")
-    translator = source.get_translation(target)
-    translated = translator.translate(text)
-    if not translated or not translated.strip():
-        raise RuntimeError("Argos returned empty translation")
-    return translated
+    This is a backup only. On low-memory Render instances even a separate
+    process can be killed by the platform's OOM killer; check Render Events.
+    """
+    worker = r"""
+import sys
+import argostranslate.translate
+lang = sys.argv[1]
+text = sys.stdin.read()
+installed = {item.code: item for item in argostranslate.translate.get_installed_languages()}
+source, target = installed.get('en'), installed.get(lang)
+if source is None or target is None:
+    raise RuntimeError(f'Argos model en->{lang} not installed')
+translated = source.get_translation(target).translate(text)
+if not translated.strip():
+    raise RuntimeError('Argos returned empty translation')
+sys.stdout.write(translated)
+"""
+    completed = subprocess.run(
+        [sys.executable, "-c", worker, target_lang],
+        input=text,
+        text=True,
+        capture_output=True,
+        timeout=20,
+        check=False,
+    )
+    if completed.returncode != 0:
+        raise RuntimeError(f"Argos worker failed ({completed.returncode}): {completed.stderr[-250:]}")
+    return completed.stdout
 
 
 def _google_main_sync(text: str, target_lang: str) -> str:
@@ -389,18 +406,16 @@ def _mymemory_translate_sync(text: str, target_lang: str) -> str:
 
 
 def _providers() -> list:
-    """(name, function, attempts) in the order they are tried."""
-    providers = []
-    if DEEPL_API_KEY:
-        providers.append(("DeepL", _deepl_translate_sync, 1))
-    providers += [
-        ("Argos offline", _argos_translate_sync, 1),
-        ("Google", _google_main_sync, 2),
+    """Google first, second Google route next, then offline Argos as a backup.
+
+    Public Lingva/MyMemory hosts are intentionally not in the active fallback
+    chain: the supplied logs show 403/429, and they delay every language.
+    """
+    return [
+        ("Google", _google_main_sync, 1),
         ("Google backup", _gtx_translate_sync, 1),
-        ("Lingva", _lingva_translate_sync, 1),
-        ("MyMemory", _mymemory_translate_sync, 1),
+        ("Argos offline backup", _argos_translate_sync, 1),
     ]
-    return providers
 
 
 async def _translate_chunk(text: str, target_lang: str, max_retries: int = 2):
@@ -421,7 +436,7 @@ async def _translate_chunk(text: str, target_lang: str, max_retries: int = 2):
             continue
         for attempt in range(attempts):
             try:
-                result = await asyncio.wait_for(asyncio.to_thread(func, text, target_lang), timeout=25)
+                result = await asyncio.wait_for(asyncio.to_thread(func, text, target_lang), timeout=26 if name.startswith("Argos") else 15)
                 if result and not _looks_like_translation_error(result):
                     logger.info(f"Translated to '{target_lang}' via {name}.")
                     return result
